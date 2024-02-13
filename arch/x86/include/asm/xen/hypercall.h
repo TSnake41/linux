@@ -46,11 +46,11 @@
 #include <asm/smap.h>
 #include <asm/nospec-branch.h>
 
-#include <xen/interface/xen.h>
-#include <xen/interface/sched.h>
-#include <xen/interface/physdev.h>
-#include <xen/interface/platform.h>
-#include <xen/interface/xen-mca.h>
+#include "../../xen/interface/xen.h"
+#include "../../xen/interface/sched.h"
+#include "../../xen/interface/physdev.h"
+#include "../../xen/interface/platform.h"
+#include "../../xen/interface/xen-mca.h"
 
 struct xen_dm_op_buf;
 
@@ -488,6 +488,13 @@ static inline int
 HYPERVISOR_xenpmu_op(unsigned int op, void *arg)
 {
 	return _hypercall2(int, xenpmu_op, op, arg);
+}
+
+#define __HYPERVISOR_iommu_op 43
+static inline int
+HYPERVISOR_iommu_op(void *arg, unsigned int count)
+{
+	return _hypercall2(int, iommu_op, arg, count);
 }
 
 static inline int
