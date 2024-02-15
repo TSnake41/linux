@@ -70,7 +70,7 @@ struct iommu_domain *xen_iommu_domain_alloc(unsigned type)
         .flags = 0,
         .subop_id = IOMMUOP_alloc_context
     };
-    
+
     if (type & IOMMU_DOMAIN_IDENTITY)
         op.flags |= IOMMU_CREATE_clone;
 
@@ -221,6 +221,48 @@ int xen_iommu_attach_dev(struct iommu_domain *domain, struct device *dev)
     return HYPERVISOR_iommu_op(&op, 1);
 }
 
+void xen_iommu_free(struct iommu_domain *domain)
+{
+    int ret;
+    struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
+
+    struct pv_iommu_op op = {
+        .ctx_no = dom->ctx_no,
+        .flags = 0,
+        .subop_id = IOMMUOP_free_context
+    };
+
+    ret = HYPERVISOR_iommu_op(&op, 1);
+
+    if (ret) {
+        pr_err("Context destruction failure");
+    }
+}
+
+phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
+{
+    int ret;
+    struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
+
+    struct pv_iommu_op op = {
+        .ctx_no = dom->ctx_no,
+        .flags = 0,
+        .subop_id = IOMMUOP_lookup_page,
+    };
+
+    op.lookup_page.dfn = iova >> XEN_PAGE_SHIFT;
+    
+    ret = HYPERVISOR_iommu_op(&op, 1);
+
+    if (ret)
+        return 0;
+
+    phys_addr_t page_addr = (op.lookup_page.gfn << XEN_PAGE_SHIFT);
+
+    /* Consider iova offset */
+    return page_addr + (iova & 0xFFF);
+}
+
 static struct iommu_ops xen_iommu_ops = {
     .capable = xen_iommu_capable,
     .domain_alloc = xen_iommu_domain_alloc,
@@ -232,6 +274,8 @@ static struct iommu_ops xen_iommu_ops = {
         .map_pages = xen_iommu_map_pages,
         .unmap_pages = xen_iommu_unmap_pages,
         .attach_dev = xen_iommu_attach_dev,
+        .iova_to_phys = xen_iommu_iova_to_phys,
+        .free = xen_iommu_free,
     },
 };
 
@@ -246,9 +290,7 @@ int __init xen_iommu_init(void)
         return -EPERM;
 
 	pr_info("Initialising Xen IOMMU driver\n");
-
-    xen_iommu_domain_alloc(0);
-
+    
     ret = iommu_device_sysfs_add(&xen_iommu_device, NULL, NULL, "xen-iommu");
     if (ret) {
         pr_err("Unable to add Xen IOMMU sysfs");
@@ -268,7 +310,7 @@ int __init xen_iommu_init(void)
 void __exit xen_iommu_fini(void)
 {
 	pr_info("Unregistering Xen IOMMU driver\n");
-
+    
     /* TOOD: Cleanup ? */
     iommu_device_unregister(&xen_iommu_device);
     iommu_device_sysfs_remove(&xen_iommu_device);
