@@ -26,6 +26,7 @@
 #include <xen/interface/physdev.h>
 #include <xen/interface/pv-iommu.h>
 #include <asm/xen/hypercall.h>
+#include <asm/xen/page.h>
 
 //#include "dma-iommu.h"
 
@@ -36,7 +37,7 @@ MODULE_LICENSE("GPL");
 #define MSI_RANGE_START         (0xfee00000)
 #define MSI_RANGE_END           (0xfeefffff)
 
-#define XEN_IOMMU_PGSIZES       (~0xFFFUL)
+#define XEN_IOMMU_PGSIZES       (0x1000UL)
 
 #define MAX_REQS   0x8000
 
@@ -53,6 +54,16 @@ static inline struct xen_iommu_domain *to_xen_iommu_domain(struct iommu_domain *
     return container_of(dom, struct xen_iommu_domain, domain);
 }
 
+static inline u64 addr_to_pfn(u64 addr)
+{
+    return addr >> XEN_PAGE_SHIFT;
+}
+
+static inline u64 pfn_to_addr(u64 pfn)
+{
+    return pfn << XEN_PAGE_SHIFT;
+}
+
 bool xen_iommu_capable(struct device *dev, enum iommu_cap cap)
 {
     /* No specific iommu_cap */
@@ -66,6 +77,9 @@ struct iommu_domain *xen_iommu_domain_alloc(unsigned type)
     int ret;
 
     if (type & IOMMU_DOMAIN_IDENTITY) {
+        /* use default domain */
+        ctx_no = 0;
+    } else {
         struct pv_iommu_op op = {
             .ctx_no = 0,
             .flags = 0,
@@ -80,9 +94,6 @@ struct iommu_domain *xen_iommu_domain_alloc(unsigned type)
         }
 
         ctx_no = op.ctx_no;
-    } else {
-        /* use default domain */
-        ctx_no = 0;
     }
 
     domain = kzalloc(sizeof(*domain), GFP_KERNEL);
@@ -112,6 +123,12 @@ struct iommu_device *xen_iommu_probe_device(struct device *dev)
     return &xen_iommu_device;
 }
 
+static void xen_iommu_probe_finalize(struct device *dev)
+{
+	set_dma_ops(dev, NULL);
+	iommu_setup_dma_ops(dev, 0, U64_MAX);
+}
+
 void xen_iommu_release_device(struct device *dev)
 {
     int ret;
@@ -132,9 +149,8 @@ void xen_iommu_release_device(struct device *dev)
 
     ret = HYPERVISOR_iommu_op(&op, 1);
 
-    if (ret) {
-        pr_warn("Unable to release device %p", &op.reattach_device.dev);
-    }
+    if (ret)
+        pr_warn("Unable to release device %p\n", &op.reattach_device.dev);
 }
 
 int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
@@ -142,7 +158,7 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 			            int prot, gfp_t gfp, size_t *mapped)
 {
     /* TODO: better handling, batching, ... */
-    size_t count = (pgsize / 0x1000) * pgcount;
+    size_t count = (pgsize / XEN_PAGE_SIZE) * pgcount;
     size_t i;
     struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
     struct pv_iommu_op op = {
@@ -151,11 +167,10 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
         .ctx_no = dom->ctx_no
     };
 
-    if (WARN(!dom->ctx_no, "Tried to map page to default context")) {
+    if (WARN(!dom->ctx_no, "Tried to map page to default context"))
         return -EINVAL;
-    }
 
-    pr_info("Mapping to %lu %zu %zu", iova, pgsize, pgcount);
+    pr_info("Mapping to %lx %zu %zu paddr %x", iova, pgsize, pgcount, paddr);
 
     if (prot & IOMMU_READ)
         op.flags |= IOMMU_OP_readable;
@@ -164,16 +179,21 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
         op.flags |= IOMMU_OP_writeable;
 
     for (i = 0; i < count; ++i) {
-        op.map_page.gfn = paddr >> XEN_PAGE_SHIFT;
-        op.map_page.dfn = iova >> XEN_PAGE_SHIFT;
+        op.map_page.gfn = addr_to_pfn(paddr) + i;
+        op.map_page.dfn = addr_to_pfn(iova) + i;
 
         int ret = HYPERVISOR_iommu_op(&op, 1);
 
-        if (ret) {
-            pr_err("Map operation failed for context %hu (%d)", dom->ctx_no, ret);
-        } else if (mapped) {
-            *mapped += 1;
+        if (ret == -EIO) {
+            pr_info("Retry mapping %lx to %lx", op.map_page.gfn, op.map_page.dfn);
+            continue;
         }
+
+        if (ret)
+            pr_err("Map operation failed for context %hu (%d)\n", dom->ctx_no, ret);
+        
+        if (mapped)
+            *mapped += 1;
     }
 
     return 0;
@@ -193,21 +213,18 @@ size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
         .flags = 0,
     };
     
-    if (WARN(!dom->ctx_no, "Tried to unmap page to default context")) {
+    if (WARN(!dom->ctx_no, "Tried to unmap page to default context"))
         return -EINVAL;
-    }
-
 
     for (i = 0; i < count; ++i) {
-        op.unmap_page.dfn = iova >> XEN_PAGE_SHIFT;
+        op.unmap_page.dfn = addr_to_pfn(iova) + i;
 
         int ret = HYPERVISOR_iommu_op(&op, 1);
 
-        if (ret) {
+        if (ret)
             pr_err("Unmap operation failed for context %hu (%d)", dom->ctx_no, ret);
-        } else {
-            unmapped++;
-        }
+        
+        unmapped++;
     }
 
     return unmapped;
@@ -215,7 +232,6 @@ size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
 
 int xen_iommu_attach_dev(struct iommu_domain *domain, struct device *dev)
 {
-    int ret;
     struct pci_dev *pdev;
     struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
     struct pv_iommu_op op = {
@@ -250,9 +266,8 @@ void xen_iommu_free(struct iommu_domain *domain)
 
         ret = HYPERVISOR_iommu_op(&op, 1);
 
-        if (ret) {
+        if (ret)
             pr_err("Context %hu destruction failure", dom->ctx_no);
-        }
     }
 
     kfree(domain);
@@ -269,25 +284,43 @@ phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
         .subop_id = IOMMUOP_lookup_page,
     };
 
-    op.lookup_page.dfn = iova >> XEN_PAGE_SHIFT;
+    op.lookup_page.dfn = addr_to_pfn(iova);
     
     ret = HYPERVISOR_iommu_op(&op, 1);
 
     if (ret)
         return 0;
 
-    phys_addr_t page_addr = (op.lookup_page.gfn << XEN_PAGE_SHIFT);
+    phys_addr_t page_addr = pfn_to_addr(op.lookup_page.gfn);
 
     /* Consider iova offset */
     return page_addr + (iova & 0xFFF);
+}
+
+void xen_iommu_get_resv_regions(struct device *device, struct list_head *head)
+{
+    #if 0
+    struct iommu_resv_region *reg;
+    
+    reg = iommu_alloc_resv_region(MSI_RANGE_START,
+        MSI_RANGE_END - MSI_RANGE_START + 1,
+        0, IOMMU_RESV_MSI, GFP_KERNEL);
+    
+    if (!reg)
+		return;
+
+	list_add_tail(&reg->list, head);
+    #endif
 }
 
 static struct iommu_ops xen_iommu_ops = {
     .capable = xen_iommu_capable,
     .domain_alloc = xen_iommu_domain_alloc,
     .probe_device = xen_iommu_probe_device,
+    .probe_finalize = xen_iommu_probe_finalize,
     .device_group = xen_iommu_device_group,
     .release_device = xen_iommu_release_device,
+    .get_resv_regions = xen_iommu_get_resv_regions,
     .pgsize_bitmap = XEN_IOMMU_PGSIZES,
     .default_domain_ops = &(const struct iommu_domain_ops) {
         .map_pages = xen_iommu_map_pages,
@@ -301,6 +334,7 @@ static struct iommu_ops xen_iommu_ops = {
 int __init xen_iommu_init(void)
 {
     int ret;
+    struct pv_iommu_op op = { .subop_id = 0 };
 
 	if (!xen_domain())
 		return -ENODEV;
@@ -308,8 +342,12 @@ int __init xen_iommu_init(void)
     if (!xen_initial_domain())
         return -EPERM;
 
+    /* Check if iommu_op is supported */
+    if (HYPERVISOR_iommu_op(&op, 1) == -ENOSYS)
+        return -ENOSYS; /* No Xen IOMMU hardware */
+
 	pr_info("Initialising Xen IOMMU driver\n");
-    
+
     ret = iommu_device_sysfs_add(&xen_iommu_device, NULL, NULL, "xen-iommu");
     if (ret) {
         pr_err("Unable to add Xen IOMMU sysfs");
@@ -322,6 +360,8 @@ int __init xen_iommu_init(void)
         iommu_device_sysfs_remove(&xen_iommu_device);
         return ret;
     }
+
+    x86_swiotlb_enable = false;
 
     return 0;
 }
