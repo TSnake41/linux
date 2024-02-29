@@ -34,10 +34,7 @@ MODULE_DESCRIPTION("Xen IOMMU driver");
 MODULE_AUTHOR("Teddy Astie <teddy.astie@vates.tech>");
 MODULE_LICENSE("GPL");
 
-#define MSI_RANGE_START         (0xfee00000)
-#define MSI_RANGE_END           (0xfeefffff)
-
-#define XEN_IOMMU_PGSIZES       (0x1000UL)
+#define XEN_IOMMU_PGSIZES       (0x1000)
 
 #define MAX_REQS   0x8000
 
@@ -179,22 +176,21 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
         op.flags |= IOMMU_OP_writeable;
 
     for (i = 0; i < count; ++i) {
-        op.map_page.gfn = addr_to_pfn(paddr) + i;
+        pr_info("Mapping %lx+%x at %lx+%x", pfn_to_gfn(addr_to_pfn(paddr)), i, addr_to_pfn(iova), i);
+        op.map_page.gfn = pfn_to_gfn(addr_to_pfn(paddr)) + i;
         op.map_page.dfn = addr_to_pfn(iova) + i;
 
         int ret = HYPERVISOR_iommu_op(&op, 1);
-
-        if (ret == -EIO) {
-            pr_info("Retry mapping %lx to %lx", op.map_page.gfn, op.map_page.dfn);
-            continue;
-        }
 
         if (ret)
             pr_err("Map operation failed for context %hu (%d)\n", dom->ctx_no, ret);
         
         if (mapped)
-            *mapped += 1;
+            *mapped += XEN_PAGE_SIZE;
     }
+
+    if (mapped)
+        pr_info("Mapped %zx", *mapped);
 
     return 0;
 }
@@ -204,15 +200,15 @@ size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
 			                 struct iommu_iotlb_gather *iotlb_gather)
 {
     /* TODO: better handling, batching, ... */
-    size_t count = (pgsize / 0x1000) * pgcount;
-    size_t i, unmapped;
+    size_t count = (pgsize / XEN_PAGE_SIZE) * pgcount;
+    size_t i;
     struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
     struct pv_iommu_op op = {
         .subop_id = IOMMUOP_unmap_page,
         .ctx_no = dom->ctx_no,
         .flags = 0,
     };
-    
+        
     if (WARN(!dom->ctx_no, "Tried to unmap page to default context"))
         return -EINVAL;
 
@@ -223,11 +219,9 @@ size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
 
         if (ret)
             pr_err("Unmap operation failed for context %hu (%d)", dom->ctx_no, ret);
-        
-        unmapped++;
     }
 
-    return unmapped;
+    return pgcount * pgsize;
 }
 
 int xen_iommu_attach_dev(struct iommu_domain *domain, struct device *dev)
@@ -291,7 +285,7 @@ phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
     if (ret)
         return 0;
 
-    phys_addr_t page_addr = pfn_to_addr(op.lookup_page.gfn);
+    phys_addr_t page_addr = pfn_to_addr(gfn_to_pfn(op.lookup_page.gfn));
 
     /* Consider iova offset */
     return page_addr + (iova & 0xFFF);
