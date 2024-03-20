@@ -34,6 +34,9 @@ MODULE_DESCRIPTION("Xen IOMMU driver");
 MODULE_AUTHOR("Teddy Astie <teddy.astie@vates.tech>");
 MODULE_LICENSE("GPL");
 
+#define MSI_RANGE_START		(0xfee00000)
+#define MSI_RANGE_END		(0xfeefffff)
+
 #define XEN_IOMMU_PGSIZES       (0x1000)
 
 #define MAX_REQS   0x8000
@@ -98,7 +101,7 @@ struct iommu_domain *xen_iommu_domain_alloc(unsigned type)
     domain->ctx_no = ctx_no;
 
     domain->domain.geometry.aperture_start = 0;
-    domain->domain.geometry.aperture_end = ~0;
+    domain->domain.geometry.aperture_end = (1ULL << 39) - 1;
     domain->domain.geometry.force_aperture = true;
 
     return &domain->domain;
@@ -176,7 +179,7 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
         op.flags |= IOMMU_OP_writeable;
 
     for (i = 0; i < count; ++i) {
-        pr_info("Mapping %lx+%x at %lx+%x", pfn_to_gfn(addr_to_pfn(paddr)), i, addr_to_pfn(iova), i);
+        pr_info("Mapping %lx+%x at %lx+%x\n", pfn_to_gfn(addr_to_pfn(paddr)), i, addr_to_pfn(iova), i);
         op.map_page.gfn = pfn_to_gfn(addr_to_pfn(paddr)) + i;
         op.map_page.dfn = addr_to_pfn(iova) + i;
 
@@ -208,11 +211,12 @@ size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
         .ctx_no = dom->ctx_no,
         .flags = 0,
     };
-        
+    
     if (WARN(!dom->ctx_no, "Tried to unmap page to default context"))
         return -EINVAL;
 
     for (i = 0; i < count; ++i) {
+        pr_info("Unmapping %lx+%x\n", addr_to_pfn(iova), i);
         op.unmap_page.dfn = addr_to_pfn(iova) + i;
 
         int ret = HYPERVISOR_iommu_op(&op, 1);
@@ -293,7 +297,6 @@ phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 
 void xen_iommu_get_resv_regions(struct device *device, struct list_head *head)
 {
-    #if 0
     struct iommu_resv_region *reg;
     
     reg = iommu_alloc_resv_region(MSI_RANGE_START,
@@ -304,7 +307,6 @@ void xen_iommu_get_resv_regions(struct device *device, struct list_head *head)
 		return;
 
 	list_add_tail(&reg->list, head);
-    #endif
 }
 
 static struct iommu_ops xen_iommu_ops = {
