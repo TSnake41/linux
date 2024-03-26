@@ -498,6 +498,12 @@ HYPERVISOR_xenpmu_op(unsigned int op, void *arg)
 	return _hypercall2(int, xenpmu_op, op, arg);
 }
 
+static inline long
+HYPERVISOR_iommu_op(unsigned int subop, void *arg)
+{
+	return _hypercall2(int, iommu_op, subop, arg);
+}
+
 static inline int
 HYPERVISOR_dm_op(
 	domid_t dom, unsigned int nr_bufs, struct xen_dm_op_buf *bufs)
