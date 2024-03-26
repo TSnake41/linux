@@ -10,6 +10,7 @@
 #ifndef __XEN_PUBLIC_MEMORY_H__
 #define __XEN_PUBLIC_MEMORY_H__
 
+#include "xen/interface/physdev.h"
 #include <linux/spinlock.h>
 
 /*
@@ -213,6 +214,38 @@ struct xen_add_to_physmap_range {
     GUEST_HANDLE(int) errs;
 };
 DEFINE_GUEST_HANDLE_STRUCT(xen_add_to_physmap_range);
+
+/*
+ * With some legacy devices, certain guest-physical addresses cannot safely
+ * be used for other purposes, e.g. to map guest RAM.  This hypercall
+ * enumerates those regions so the toolstack can avoid using them.
+ */
+#define XENMEM_reserved_device_memory_map   27
+struct xen_reserved_device_memory {
+    xen_pfn_t start_pfn;
+    xen_ulong_t nr_pages;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_reserved_device_memory);
+
+struct xen_reserved_device_memory_map {
+#define XENMEM_RDM_ALL 1 /* Request all regions (ignore dev union). */
+    /* IN */
+    uint32_t flags;
+    /*
+     * IN/OUT
+     *
+     * Gets set to the required number of entries when too low,
+     * signaled by error code -ERANGE.
+     */
+    unsigned int nr_entries;
+    /* OUT */
+    GUEST_HANDLE(xen_reserved_device_memory) buffer;
+    /* IN */
+    union {
+        struct physdev_pci_device pci;
+    } dev;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_reserved_device_memory_map);
 
 /*
  * Returns the pseudo-physical memory map as it was when the domain

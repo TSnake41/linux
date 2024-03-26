@@ -65,6 +65,7 @@
 #define __HYPERVISOR_xc_reserved_op       39 /* reserved for XenClient */
 #define __HYPERVISOR_xenpmu_op            40
 #define __HYPERVISOR_dm_op                41
+#define __HYPERVISOR_iommu_op 					  43
 
 /* Architecture-specific hypercall definitions. */
 #define __HYPERVISOR_arch_0               48
