@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-
 /*
  * Xen PV-IOMMU driver.
  *
@@ -48,51 +47,15 @@ MODULE_LICENSE("GPL");
 #define XEN_IOMMU_ADDR_MAX ((1ULL << 39) - 1)
 
 /* Maximum amount of batched hypercalls before flushing. */
-#define XEN_IOMMU_MAX_HYPERCALL     (64)
+#define XEN_IOMMU_MAX_HYPERCALL     (32)
 
 struct xen_iommu_domain {
     struct iommu_domain domain;
-    
+
     u16 ctx_no; /* Xen PV-IOMMU context number */
 };
 
 static struct iommu_device xen_iommu_device;
-
-/* Queue for batching map operations */
-static spinlock_t hypercall_queue_lock;
-static size_t hypercall_queue_count;
-static struct pv_iommu_op hypercall_queue[XEN_IOMMU_MAX_HYPERCALL];
-
-static void flush_queue(void)
-{
-    size_t i;
-    
-    pr_debug("Flushing hypercall queue");
-
-    HYPERVISOR_iommu_op(hypercall_queue, hypercall_queue_count);
-
-    for (i = 0; i < hypercall_queue_count; i++) {
-        pr_debug("Issued hypercall %d ctx_no=%d, flags=%4x", hypercall_queue[i].subop_id,
-            hypercall_queue[i].ctx_no, hypercall_queue[i].flags);
-
-        /* TODO: Check errors ? */
-    }
-
-    hypercall_queue_count = 0;
-}
-
-static void push_hypercall(struct pv_iommu_op op)
-{
-    spin_lock(&hypercall_queue_lock);
-    
-    hypercall_queue[hypercall_queue_count] = op;
-    hypercall_queue_count++;
-
-    if (hypercall_queue_count == XEN_IOMMU_MAX_HYPERCALL)
-        flush_queue();
-
-    spin_unlock(&hypercall_queue_lock);
-}
 
 static inline struct xen_iommu_domain *to_xen_iommu_domain(struct iommu_domain *dom)
 {
@@ -153,7 +116,7 @@ struct iommu_domain *xen_iommu_domain_alloc(unsigned type)
     return &domain->domain;
 }
 
-struct iommu_group *xen_iommu_device_group(struct device *dev)
+static struct iommu_group *xen_iommu_device_group(struct device *dev)
 {
 	if (!dev_is_pci(dev))
 		return ERR_PTR(-ENODEV);
@@ -161,7 +124,7 @@ struct iommu_group *xen_iommu_device_group(struct device *dev)
 	return pci_device_group(dev);
 }
 
-struct iommu_device *xen_iommu_probe_device(struct device *dev)
+static struct iommu_device *xen_iommu_probe_device(struct device *dev)
 {
     if (!dev_is_pci(dev))
         return ERR_PTR(-ENODEV);
@@ -175,7 +138,7 @@ static void xen_iommu_probe_finalize(struct device *dev)
 	iommu_setup_dma_ops(dev, 0, XEN_IOMMU_ADDR_MAX);
 }
 
-void xen_iommu_release_device(struct device *dev)
+static void xen_iommu_release_device(struct device *dev)
 {
     int ret;
     struct pci_dev *pdev;
@@ -200,11 +163,10 @@ void xen_iommu_release_device(struct device *dev)
         pr_warn("Unable to release device %p\n", &op.reattach_device.dev);
 }
 
-int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
-                        phys_addr_t paddr, size_t pgsize, size_t pgcount,
-			            int prot, gfp_t gfp, size_t *mapped)
+static int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
+                               phys_addr_t paddr, size_t pgsize, size_t pgcount,
+			                   int prot, gfp_t gfp, size_t *mapped)
 {
-    /* TODO: better handling, batching, ... */
     size_t count = (pgsize / XEN_PAGE_SIZE) * pgcount;
     size_t i;
     struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
@@ -213,6 +175,10 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
         .flags = 0,
         .ctx_no = dom->ctx_no
     };
+
+    /* Buffer for batching operations */
+    struct pv_iommu_op hypercall_buffer[XEN_IOMMU_MAX_HYPERCALL];
+    size_t hypercall_count = 0;
 
     if (WARN(!dom->ctx_no, "Tried to map page to default context"))
         return -EINVAL;
@@ -226,15 +192,27 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
         op.flags |= IOMMU_OP_writeable;
 
     for (i = 0; i < count; ++i) {
-        pr_debug("Mapping %lx+%x at %lx+%x\n", pfn_to_gfn(addr_to_pfn(paddr)), i, addr_to_pfn(iova), i);
+        pr_debug("Mapping %lx+%x at %lx+%x\n", pfn_to_gfn(addr_to_pfn(paddr)), i,
+                 addr_to_pfn(iova), i);
+
         op.map_page.gfn = pfn_to_gfn(addr_to_pfn(paddr)) + i;
         op.map_page.dfn = addr_to_pfn(iova) + i;
 
-        push_hypercall(op);
+        hypercall_buffer[hypercall_count] = op;
+        hypercall_count++;
+
+        if (hypercall_count == XEN_IOMMU_MAX_HYPERCALL) {
+            /* Flush buffer */
+            HYPERVISOR_iommu_op(hypercall_buffer, XEN_IOMMU_MAX_HYPERCALL);
+            hypercall_count = 0;
+        }
         
         if (mapped)
             *mapped += XEN_PAGE_SIZE;
     }
+
+    if (hypercall_count)
+        HYPERVISOR_iommu_op(hypercall_buffer, hypercall_count);
 
     if (mapped)
         pr_debug("Mapped %zx", *mapped);
@@ -242,9 +220,9 @@ int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
     return 0;
 }
 
-size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
-			                 size_t pgsize, size_t pgcount,
-			                 struct iommu_iotlb_gather *iotlb_gather)
+static size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
+                                    size_t pgsize, size_t pgcount,
+			                        struct iommu_iotlb_gather *iotlb_gather)
 {
     int ret;
     size_t i, count = (pgsize / XEN_PAGE_SIZE) * pgcount;
@@ -254,6 +232,10 @@ size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
         .ctx_no = dom->ctx_no,
         .flags = 0,
     };
+
+    /* Buffer for batching operations */
+    struct pv_iommu_op hypercall_buffer[XEN_IOMMU_MAX_HYPERCALL];
+    size_t hypercall_count = 0;
     
     if (WARN(!dom->ctx_no, "Tried to unmap page to default context"))
         return -EINVAL;
@@ -262,8 +244,18 @@ size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
         pr_debug("Unmapping %lx+%x\n", addr_to_pfn(iova), i);
         op.unmap_page.dfn = addr_to_pfn(iova) + i;
 
-        push_hypercall(op);
+        hypercall_buffer[hypercall_count] = op;
+        hypercall_count++;
+
+        if (hypercall_count == XEN_IOMMU_MAX_HYPERCALL) {
+            /* Flush buffer */
+            HYPERVISOR_iommu_op(hypercall_buffer, XEN_IOMMU_MAX_HYPERCALL);
+            hypercall_count = 0;
+        }
     }
+
+    if (hypercall_count)
+        HYPERVISOR_iommu_op(hypercall_buffer, hypercall_count);
 
     return pgcount * pgsize;
 }
@@ -287,15 +279,10 @@ int xen_iommu_attach_dev(struct iommu_domain *domain, struct device *dev)
     op.reattach_device.dev.bus = pdev->bus->number;
     op.reattach_device.dev.devfn = pdev->devfn;
 
-    /* Ensure the mappings are coherent when moving the device */
-    spin_lock(&hypercall_queue_lock);
-    flush_queue();
-    spin_unlock(&hypercall_queue_lock);
-
     return HYPERVISOR_iommu_op(&op, 1);
 }
 
-void xen_iommu_free(struct iommu_domain *domain)
+static void xen_iommu_free(struct iommu_domain *domain)
 {
     int ret;
     struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
@@ -307,12 +294,7 @@ void xen_iommu_free(struct iommu_domain *domain)
             .subop_id = IOMMUOP_free_context
         };
 
-        /* Make sure that no pending operation target this domain */
-        spin_lock(&hypercall_queue_lock);
-        flush_queue();
-
         ret = HYPERVISOR_iommu_op(&op, 1);
-        spin_unlock(&hypercall_queue_lock);
 
         if (ret)
             pr_err("Context %hu destruction failure", dom->ctx_no);
@@ -321,7 +303,7 @@ void xen_iommu_free(struct iommu_domain *domain)
     kfree(domain);
 }
 
-phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
+static phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 {
     int ret;
     struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
@@ -334,11 +316,7 @@ phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 
     op.lookup_page.dfn = addr_to_pfn(iova);
     
-    spin_lock(&hypercall_queue_lock);
-    flush_queue();
-
     ret = HYPERVISOR_iommu_op(&op, 1);
-    spin_unlock(&hypercall_queue_lock);
 
     if (ret)
         return 0;
@@ -349,7 +327,7 @@ phys_addr_t xen_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
     return page_addr + (iova & 0xFFF);
 }
 
-void xen_iommu_get_resv_regions(struct device *device, struct list_head *head)
+static void xen_iommu_get_resv_regions(struct device *device, struct list_head *head)
 {
     struct iommu_resv_region *reg;
     
