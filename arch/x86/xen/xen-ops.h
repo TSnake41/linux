@@ -143,7 +143,7 @@ struct multicall_space xen_mc_extend_args(unsigned long op, size_t arg_size);
 extern bool is_xen_pmu;
 
 irqreturn_t xen_pmu_irq_handler(int irq, void *dev_id);
-bool pmu_msr_chk_emulated(u32 msr, u64 *val, bool is_read);
+bool pmu_msr_chk_emulated(u32 msr, u64 *val, bool is_read, int *err);
 int pmu_apic_update(uint32_t reg);
 u64 xen_read_pmc(int counter);
 

@@ -304,6 +304,12 @@ OPTIONS
 --vmlinux=<file>::
         vmlinux pathname
 
+--hypervisor-image=<file>::
+	Image of the hypervisor running underneath the profiled kernel (e.g.
+	Xen's xen-syms), used to resolve the symbols of hypervisor samples and
+	callchain entries (PERF_RECORD_MISC_HYPERVISOR cpumode). The image is
+	mapped at its link address.
+
 --kallsyms=<file>::
         kallsyms pathname
 

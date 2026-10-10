@@ -97,6 +97,13 @@
 #define XENFEAT_not_direct_mapped         16
 #define XENFEAT_direct_mapped             17
 
+/*
+ * x86: If set, the domain owns the physical PMU of the pCPUs its (pinned)
+ * vCPUs run on, and can use it to profile the whole system.  See
+ * HYPERVISOR_xenpmu_op in xenpmu.h.
+ */
+#define XENFEAT_vpmu                      21
+
 #define XENFEAT_NR_SUBMAPS 1
 
 #endif /* __XEN_PUBLIC_FEATURES_H__ */

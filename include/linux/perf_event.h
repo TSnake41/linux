@@ -1656,6 +1656,12 @@ extern void perf_event_bpf_event(struct bpf_prog *prog,
 
 #define PERF_GUEST_ACTIVE		0x01
 #define PERF_GUEST_USER			0x02
+/*
+ * The sample hit the hypervisor (e.g. Xen) running underneath the kernel,
+ * rather than the kernel or one of its guests.  Mutually exclusive with
+ * PERF_GUEST_ACTIVE.
+ */
+#define PERF_GUEST_HYPERVISOR		0x04
 
 struct perf_guest_info_callbacks {
 	unsigned int			(*state)(void);
@@ -1663,6 +1669,14 @@ struct perf_guest_info_callbacks {
 	unsigned int			(*handle_intel_pt_intr)(void);
 
 	void				(*handle_mediated_pmi)(void);
+
+	/*
+	 * Callchain of a PERF_GUEST_HYPERVISOR sample.  Returns the registers
+	 * of the context which called into the hypervisor, to carry on with its
+	 * callchain, or NULL if the hypervisor wasn't running on our behalf.
+	 */
+	struct pt_regs			*(*hypervisor_callchain)(struct perf_callchain_entry_ctx *entry,
+								 struct pt_regs *regs);
 };
 
 #ifdef CONFIG_GUEST_PERF_EVENTS
@@ -1673,6 +1687,7 @@ DECLARE_STATIC_CALL(__perf_guest_state, *perf_guest_cbs->state);
 DECLARE_STATIC_CALL(__perf_guest_get_ip, *perf_guest_cbs->get_ip);
 DECLARE_STATIC_CALL(__perf_guest_handle_intel_pt_intr, *perf_guest_cbs->handle_intel_pt_intr);
 DECLARE_STATIC_CALL(__perf_guest_handle_mediated_pmi, *perf_guest_cbs->handle_mediated_pmi);
+DECLARE_STATIC_CALL(__perf_hypervisor_callchain, *perf_guest_cbs->hypervisor_callchain);
 
 static inline unsigned int perf_guest_state(void)
 {
@@ -1694,6 +1709,13 @@ static inline void perf_guest_handle_mediated_pmi(void)
 	static_call(__perf_guest_handle_mediated_pmi)();
 }
 
+static inline struct pt_regs *
+perf_hypervisor_callchain(struct perf_callchain_entry_ctx *entry,
+			  struct pt_regs *regs)
+{
+	return static_call(__perf_hypervisor_callchain)(entry, regs);
+}
+
 extern void perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *cbs);
 extern void perf_unregister_guest_info_callbacks(struct perf_guest_info_callbacks *cbs);
 
@@ -1702,6 +1724,9 @@ extern void perf_unregister_guest_info_callbacks(struct perf_guest_info_callback
 static inline unsigned int perf_guest_state(void)		 { return 0; }
 static inline unsigned long perf_guest_get_ip(void)		 { return 0; }
 static inline unsigned int perf_guest_handle_intel_pt_intr(void) { return 0; }
+static inline struct pt_regs *
+perf_hypervisor_callchain(struct perf_callchain_entry_ctx *entry,
+			  struct pt_regs *regs)		 { return NULL; }
 
 #endif /* !CONFIG_GUEST_PERF_EVENTS */
 

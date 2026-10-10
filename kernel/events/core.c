@@ -7761,6 +7761,7 @@ DEFINE_STATIC_CALL_RET0(__perf_guest_state, *perf_guest_cbs->state);
 DEFINE_STATIC_CALL_RET0(__perf_guest_get_ip, *perf_guest_cbs->get_ip);
 DEFINE_STATIC_CALL_RET0(__perf_guest_handle_intel_pt_intr, *perf_guest_cbs->handle_intel_pt_intr);
 DEFINE_STATIC_CALL_RET0(__perf_guest_handle_mediated_pmi, *perf_guest_cbs->handle_mediated_pmi);
+DEFINE_STATIC_CALL_RET0(__perf_hypervisor_callchain, *perf_guest_cbs->hypervisor_callchain);
 
 void perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *cbs)
 {
@@ -7779,6 +7780,10 @@ void perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *cbs)
 	if (cbs->handle_mediated_pmi)
 		static_call_update(__perf_guest_handle_mediated_pmi,
 				   cbs->handle_mediated_pmi);
+
+	if (cbs->hypervisor_callchain)
+		static_call_update(__perf_hypervisor_callchain,
+				   cbs->hypervisor_callchain);
 }
 EXPORT_SYMBOL_GPL(perf_register_guest_info_callbacks);
 
@@ -7792,6 +7797,7 @@ void perf_unregister_guest_info_callbacks(struct perf_guest_info_callbacks *cbs)
 	static_call_update(__perf_guest_get_ip, (void *)&__static_call_return0);
 	static_call_update(__perf_guest_handle_intel_pt_intr, (void *)&__static_call_return0);
 	static_call_update(__perf_guest_handle_mediated_pmi, (void *)&__static_call_return0);
+	static_call_update(__perf_hypervisor_callchain, (void *)&__static_call_return0);
 	synchronize_rcu();
 }
 EXPORT_SYMBOL_GPL(perf_unregister_guest_info_callbacks);
@@ -7799,12 +7805,23 @@ EXPORT_SYMBOL_GPL(perf_unregister_guest_info_callbacks);
 
 static bool should_sample_guest(struct perf_event *event)
 {
-	return !event->attr.exclude_guest && perf_guest_state();
+	return !event->attr.exclude_guest &&
+	       (perf_guest_state() & PERF_GUEST_ACTIVE);
+}
+
+static bool is_hypervisor_sample(void)
+{
+	return perf_guest_state() & PERF_GUEST_HYPERVISOR;
 }
 
 unsigned long perf_misc_flags(struct perf_event *event,
 			      struct pt_regs *regs)
 {
+	if (is_hypervisor_sample())
+		return (perf_arch_misc_flags(regs) &
+			~PERF_RECORD_MISC_CPUMODE_MASK) |
+		       PERF_RECORD_MISC_HYPERVISOR;
+
 	if (should_sample_guest(event))
 		return perf_arch_guest_misc_flags(regs);
 
@@ -7820,6 +7837,9 @@ unsigned long perf_instruction_pointer(struct perf_event *event,
 	 * In that case, user-space sampling must not expose kernel
 	 * register state.
 	 */
+	if (is_hypervisor_sample())
+		return event->attr.exclude_hv ? 0 : perf_guest_get_ip();
+
 	if (should_sample_guest(event)) {
 		return event->attr.exclude_kernel &&
 		       !(perf_guest_state() & PERF_GUEST_USER) ?

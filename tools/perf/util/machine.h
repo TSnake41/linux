@@ -45,6 +45,8 @@ struct machine {
 	struct dsos	  dsos;
 	struct maps	  *kmaps;
 	struct map	  *vmlinux_map;
+	struct maps	  *hv_maps;
+	bool		  hv_maps_init;
 	u64		  kernel_start;
 	struct {
 		u64	  text_start;
@@ -83,6 +85,8 @@ struct maps *machine__kernel_maps(struct machine *machine)
 {
 	return machine->kmaps;
 }
+
+struct maps *machine__hypervisor_maps(struct machine *machine);
 
 int machine__get_kernel_start(struct machine *machine);
 

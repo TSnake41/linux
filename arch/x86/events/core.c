@@ -2882,7 +2882,7 @@ perf_callchain_kernel(struct perf_callchain_entry_ctx *entry, struct pt_regs *re
 	struct unwind_state state;
 	unsigned long addr;
 
-	if (perf_guest_state()) {
+	if (perf_guest_state() & PERF_GUEST_ACTIVE) {
 		/* TODO: We don't support guest os callchain now */
 		return;
 	}
@@ -3000,7 +3000,7 @@ perf_callchain_user(struct perf_callchain_entry_ctx *entry, struct pt_regs *regs
 	const struct stack_frame __user *fp;
 	unsigned long ret_addr;
 
-	if (perf_guest_state()) {
+	if (perf_guest_state() & PERF_GUEST_ACTIVE) {
 		/* TODO: We don't support guest os callchain now */
 		return;
 	}

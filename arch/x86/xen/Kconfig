@@ -70,6 +70,8 @@ config XEN_DOM0
 	depends on (XEN_PV && SWIOTLB_XEN) || (XEN_PVH && X86_64)
 	depends on X86_IO_APIC && ACPI && PCI
 	select X86_X2APIC if XEN_PVH && X86_64
+	select XEN_HAVE_VPMU if XEN_PVH
+	select GUEST_PERF_EVENTS if XEN_PVH
 	help
 	  Support running as a Xen Dom0 guest.
 

@@ -41,6 +41,7 @@ static void __init xen_hvm_smp_prepare_cpus(unsigned int max_cpus)
 	if (xen_have_vector_callback) {
 		WARN_ON(xen_smp_intr_init(0));
 		xen_init_lock_cpu(0);
+		xen_pmu_init(0);
 	}
 
 	for_each_possible_cpu(cpu) {
@@ -56,6 +57,7 @@ static void __init xen_hvm_smp_prepare_cpus(unsigned int max_cpus)
 static void xen_hvm_cleanup_dead_cpu(unsigned int cpu)
 {
 	if (xen_have_vector_callback) {
+		xen_pmu_finish(cpu);
 		xen_smp_intr_free(cpu);
 		xen_uninit_lock_cpu(cpu);
 		xen_teardown_timer(cpu);

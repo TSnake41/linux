@@ -1191,6 +1191,13 @@ static int deliver_event(struct ordered_events *qe,
 			goto next_event;
 		machine = &session->machines.host;
 		break;
+	case PERF_RECORD_MISC_HYPERVISOR:
+		/* Hypervisor running underneath the host, e.g. Xen. */
+		++top->kernel_samples;
+		if (top->hide_kernel_symbols)
+			goto next_event;
+		machine = &session->machines.host;
+		break;
 	case PERF_RECORD_MISC_GUEST_KERNEL:
 		++top->guest_kernel_samples;
 		machine = perf_session__find_machine(session,
@@ -1503,6 +1510,8 @@ int cmd_top(int argc, const char **argv)
 		    "list of cpus to monitor"),
 	OPT_STRING('k', "vmlinux", &symbol_conf.vmlinux_name,
 		   "file", "vmlinux pathname"),
+	OPT_STRING(0, "hypervisor-image", &symbol_conf.hypervisor_name,
+		   "file", "hypervisor image (e.g. Xen's xen-syms) to resolve hypervisor samples"),
 	OPT_BOOLEAN(0, "ignore-vmlinux", &symbol_conf.ignore_vmlinux,
 		    "don't load vmlinux even if found"),
 	OPT_STRING(0, "kallsyms", &symbol_conf.kallsyms_name,

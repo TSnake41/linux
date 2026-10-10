@@ -238,6 +238,23 @@ get_perf_callchain(struct pt_regs *regs, bool kernel, bool user,
 	ctx.contexts		= 0;
 	ctx.contexts_maxed	= false;
 
+	if (perf_guest_state() & PERF_GUEST_HYPERVISOR) {
+		if (!kernel)
+			goto exit_put;
+
+		if (add_mark)
+			perf_callchain_store_context(&ctx, PERF_CONTEXT_HV);
+
+		/*
+		 * Carry on with the context which called into the hypervisor,
+		 * if any.  Otherwise, the interrupted context is unrelated to
+		 * the sample.
+		 */
+		regs = perf_hypervisor_callchain(&ctx, regs);
+		if (!regs)
+			goto exit_put;
+	}
+
 	if (kernel && !user_mode(regs)) {
 		if (add_mark)
 			perf_callchain_store_context(&ctx, PERF_CONTEXT_KERNEL);

@@ -65,7 +65,7 @@ static u32 xen_apic_read(u32 reg)
 static void xen_apic_write(u32 reg, u32 val)
 {
 	if (reg == APIC_LVTPC) {
-		(void)pmu_apic_update(reg);
+		(void)pmu_apic_update(val);
 		return;
 	}
 

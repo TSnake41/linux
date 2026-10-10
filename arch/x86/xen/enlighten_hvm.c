@@ -187,8 +187,12 @@ static int xen_cpu_up_prepare_hvm(unsigned int cpu)
 	if (rc) {
 		WARN(1, "xen_smp_intr_init() for CPU %d failed: %d\n",
 		     cpu, rc);
+		return rc;
 	}
-	return rc;
+
+	xen_pmu_init(cpu);
+
+	return 0;
 }
 
 static int xen_cpu_dead_hvm(unsigned int cpu)

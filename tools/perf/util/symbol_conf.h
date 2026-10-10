@@ -71,6 +71,7 @@ struct symbol_conf {
 			enable_latency,
 			prefer_latency;
 	const char	*vmlinux_name,
+			*hypervisor_name,
 			*kallsyms_name,
 			*source_prefix,
 			*field_sep,

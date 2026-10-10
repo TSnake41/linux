@@ -721,6 +721,11 @@ struct map *thread__find_map(struct thread *thread, u8 cpumode, u64 addr,
 		load_map = !symbol_conf.lazy_load_kernel_maps;
 	} else if (cpumode == PERF_RECORD_MISC_GUEST_USER && perf_guest) {
 		al->level = 'u';
+	} else if (cpumode == PERF_RECORD_MISC_HYPERVISOR &&
+		   machine__hypervisor_maps(machine)) {
+		al->level = 'H';
+		maps = machine__hypervisor_maps(machine);
+		load_map = true;
 	} else {
 		al->level = 'H';
 

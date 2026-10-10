@@ -1,14 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * PMU support for a PV or PVH hardware domain, when Xen runs with
+ * "vpmu=global".
+ *
+ * In this mode, the hardware domain owns the physical PMU of the pCPUs its
+ * (pinned) vCPUs run on, and can profile the whole system:
+ *  - PV: PMU MSRs are accessed through XENPMU_{read,write}_regs, and counters
+ *    are read with RDPMC, as Xen sets CR4.PCE.
+ *  - PVH: PMU MSRs are accessed directly.
+ *  - PMIs are delivered through VIRQ_XENPMU, along with information about the
+ *    interrupted context in a per-vCPU shared page.  Xen keeps the LVTPC
+ *    masked until we acknowledge the PMI with XENPMU_lvtpc_set.
+ */
 #include <linux/types.h>
 #include <linux/interrupt.h>
+#include <linux/slab.h>
 
-#include <asm/cpuid/api.h>
+#include <asm/apicdef.h>
+#include <asm/irq_regs.h>
 #include <asm/msr.h>
 #include <asm/xen/hypercall.h>
+#include <xen/events.h>
+#include <xen/features.h>
 #include <xen/xen.h>
 #include <xen/page.h>
 #include <xen/interface/xen.h>
-#include <xen/interface/vcpu.h>
 #include <xen/interface/xenpmu.h>
 
 #include "xen-ops.h"
@@ -16,394 +32,154 @@
 /* x86_pmu.handle_irq definition */
 #include "../events/perf_event.h"
 
-#define XENPMU_IRQ_PROCESSING    1
 struct xenpmu {
 	/* Shared page between hypervisor and domain */
 	struct xen_pmu_data *xenpmu_data;
 
-	uint8_t flags;
+	/* A PMI is being handled: LVTPC updates are deferred until its end. */
+	bool irq_processing;
+	uint32_t lvtpc;
+
+	/* PVH: VIRQ_XENPMU binding (PV binds it in xen_smp_intr_init_pv()). */
+	int irq;
+	char *irq_name;
 };
 static DEFINE_PER_CPU(struct xenpmu, xenpmu_shared);
 #define get_xenpmu_data()    (this_cpu_ptr(&xenpmu_shared)->xenpmu_data)
-#define get_xenpmu_flags()   (this_cpu_ptr(&xenpmu_shared)->flags)
 
-/* Macro for computing address of a PMU MSR bank */
-#define field_offset(ctxt, field) ((void *)((uintptr_t)ctxt + \
-					    (uintptr_t)ctxt->field))
+/* Counters Xen gives access to. */
+#define INTEL_MAX_GP_COUNTERS       8
+#define INTEL_MAX_FIXED_COUNTERS    3
 
-/* AMD PMU */
-#define F15H_NUM_COUNTERS   6
-#define F10H_NUM_COUNTERS   4
+bool is_xen_pmu;
 
-static __read_mostly uint32_t amd_counters_base;
-static __read_mostly uint32_t amd_ctrls_base;
-static __read_mostly int amd_msr_step;
-static __read_mostly int k7_counters_mirrored;
-static __read_mostly int amd_num_counters;
-
-/* Intel PMU */
-#define MSR_TYPE_COUNTER            0
-#define MSR_TYPE_CTRL               1
-#define MSR_TYPE_GLOBAL             2
-#define MSR_TYPE_ARCH_COUNTER       3
-#define MSR_TYPE_ARCH_CTRL          4
-
-/* Number of general pmu registers (CPUID.EAX[0xa].EAX[8..15]) */
-#define PMU_GENERAL_NR_SHIFT        8
-#define PMU_GENERAL_NR_BITS         8
-#define PMU_GENERAL_NR_MASK         (((1 << PMU_GENERAL_NR_BITS) - 1) \
-				     << PMU_GENERAL_NR_SHIFT)
-
-/* Number of fixed pmu registers (CPUID.EDX[0xa].EDX[0..4]) */
-#define PMU_FIXED_NR_SHIFT          0
-#define PMU_FIXED_NR_BITS           5
-#define PMU_FIXED_NR_MASK           (((1 << PMU_FIXED_NR_BITS) - 1) \
-				     << PMU_FIXED_NR_SHIFT)
-
-/* Alias registers (0x4c1) for full-width writes to PMCs */
-#define MSR_PMC_ALIAS_MASK          (~(MSR_IA32_PERFCTR0 ^ MSR_IA32_PMC0))
-
-#define INTEL_PMC_TYPE_SHIFT        30
-
-static __read_mostly int intel_num_arch_counters, intel_num_fixed_counters;
-
-
-static void xen_pmu_arch_init(void)
+static bool is_pmu_msr(u32 msr)
 {
-	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+	switch (boot_cpu_data.x86_vendor) {
+	case X86_VENDOR_AMD:
+	case X86_VENDOR_HYGON:
+		return (msr >= MSR_K7_EVNTSEL0 && msr <= MSR_K7_PERFCTR3) ||
+		       (msr >= MSR_F15H_PERF_CTL0 && msr <= MSR_F15H_PERF_CTR5);
 
-		switch (boot_cpu_data.x86) {
-		case 0x15:
-			amd_num_counters = F15H_NUM_COUNTERS;
-			amd_counters_base = MSR_F15H_PERF_CTR;
-			amd_ctrls_base = MSR_F15H_PERF_CTL;
-			amd_msr_step = 2;
-			k7_counters_mirrored = 1;
-			break;
-		case 0x10:
-		case 0x12:
-		case 0x14:
-		case 0x16:
-		default:
-			amd_num_counters = F10H_NUM_COUNTERS;
-			amd_counters_base = MSR_K7_PERFCTR0;
-			amd_ctrls_base = MSR_K7_EVNTSEL0;
-			amd_msr_step = 1;
-			k7_counters_mirrored = 0;
-			break;
-		}
-	} else if (boot_cpu_data.x86_vendor == X86_VENDOR_HYGON) {
-		amd_num_counters = F10H_NUM_COUNTERS;
-		amd_counters_base = MSR_K7_PERFCTR0;
-		amd_ctrls_base = MSR_K7_EVNTSEL0;
-		amd_msr_step = 1;
-		k7_counters_mirrored = 0;
-	} else {
-		uint32_t eax, ebx, ecx, edx;
-
-		cpuid(0xa, &eax, &ebx, &ecx, &edx);
-
-		intel_num_arch_counters = (eax & PMU_GENERAL_NR_MASK) >>
-			PMU_GENERAL_NR_SHIFT;
-		intel_num_fixed_counters = (edx & PMU_FIXED_NR_MASK) >>
-			PMU_FIXED_NR_SHIFT;
-	}
-}
-
-static inline uint32_t get_fam15h_addr(u32 addr)
-{
-	switch (addr) {
-	case MSR_K7_PERFCTR0:
-	case MSR_K7_PERFCTR1:
-	case MSR_K7_PERFCTR2:
-	case MSR_K7_PERFCTR3:
-		return MSR_F15H_PERF_CTR + (addr - MSR_K7_PERFCTR0);
-	case MSR_K7_EVNTSEL0:
-	case MSR_K7_EVNTSEL1:
-	case MSR_K7_EVNTSEL2:
-	case MSR_K7_EVNTSEL3:
-		return MSR_F15H_PERF_CTL + (addr - MSR_K7_EVNTSEL0);
-	default:
-		break;
-	}
-
-	return addr;
-}
-
-static bool is_amd_pmu_msr(u32 msr)
-{
-	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
-	    boot_cpu_data.x86_vendor != X86_VENDOR_HYGON)
-		return false;
-
-	if ((msr >= MSR_F15H_PERF_CTL &&
-	     msr < MSR_F15H_PERF_CTR + (amd_num_counters * 2)) ||
-	    (msr >= MSR_K7_EVNTSEL0 &&
-	     msr < MSR_K7_PERFCTR0 + amd_num_counters))
-		return true;
-
-	return false;
-}
-
-static bool is_intel_pmu_msr(u32 msr_index, int *type, int *index)
-{
-	u32 msr_index_pmc;
-
-	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL &&
-	    boot_cpu_data.x86_vendor != X86_VENDOR_CENTAUR &&
-	    boot_cpu_data.x86_vendor != X86_VENDOR_ZHAOXIN)
-		return false;
-
-	switch (msr_index) {
-	case MSR_CORE_PERF_FIXED_CTR_CTRL:
-	case MSR_IA32_DS_AREA:
-	case MSR_IA32_PEBS_ENABLE:
-		*type = MSR_TYPE_CTRL;
-		return true;
-
-	case MSR_CORE_PERF_GLOBAL_CTRL:
-	case MSR_CORE_PERF_GLOBAL_STATUS:
-	case MSR_CORE_PERF_GLOBAL_OVF_CTRL:
-		*type = MSR_TYPE_GLOBAL;
-		return true;
+	case X86_VENDOR_INTEL:
+	case X86_VENDOR_CENTAUR:
+	case X86_VENDOR_ZHAOXIN:
+		return (msr >= MSR_IA32_PERFCTR0 &&
+			msr < MSR_IA32_PERFCTR0 + INTEL_MAX_GP_COUNTERS) ||
+		       (msr >= MSR_IA32_PMC0 &&
+			msr < MSR_IA32_PMC0 + INTEL_MAX_GP_COUNTERS) ||
+		       (msr >= MSR_P6_EVNTSEL0 &&
+			msr < MSR_P6_EVNTSEL0 + INTEL_MAX_GP_COUNTERS) ||
+		       (msr >= MSR_CORE_PERF_FIXED_CTR0 &&
+			msr < MSR_CORE_PERF_FIXED_CTR0 +
+			      INTEL_MAX_FIXED_COUNTERS) ||
+		       (msr >= MSR_CORE_PERF_FIXED_CTR_CTRL &&
+			msr <= MSR_CORE_PERF_GLOBAL_OVF_CTRL);
 
 	default:
-
-		if ((msr_index >= MSR_CORE_PERF_FIXED_CTR0) &&
-		    (msr_index < MSR_CORE_PERF_FIXED_CTR0 +
-				 intel_num_fixed_counters)) {
-			*index = msr_index - MSR_CORE_PERF_FIXED_CTR0;
-			*type = MSR_TYPE_COUNTER;
-			return true;
-		}
-
-		if ((msr_index >= MSR_P6_EVNTSEL0) &&
-		    (msr_index < MSR_P6_EVNTSEL0 +  intel_num_arch_counters)) {
-			*index = msr_index - MSR_P6_EVNTSEL0;
-			*type = MSR_TYPE_ARCH_CTRL;
-			return true;
-		}
-
-		msr_index_pmc = msr_index & MSR_PMC_ALIAS_MASK;
-		if ((msr_index_pmc >= MSR_IA32_PERFCTR0) &&
-		    (msr_index_pmc < MSR_IA32_PERFCTR0 +
-				     intel_num_arch_counters)) {
-			*type = MSR_TYPE_ARCH_COUNTER;
-			*index = msr_index_pmc - MSR_IA32_PERFCTR0;
-			return true;
-		}
 		return false;
 	}
 }
 
-static bool xen_intel_pmu_emulate(u32 msr, u64 *val, int type, int index, bool is_read)
+static int xen_pmu_reg_op(unsigned int op, u32 msr, u64 *val)
 {
-	uint64_t *reg = NULL;
-	struct xen_pmu_intel_ctxt *ctxt;
-	uint64_t *fix_counters;
-	struct xen_pmu_cntr_pair *arch_cntr_pair;
-	struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
-	uint8_t xenpmu_flags = get_xenpmu_flags();
-
-
-	if (!xenpmu_data || !(xenpmu_flags & XENPMU_IRQ_PROCESSING))
-		return false;
-
-	ctxt = &xenpmu_data->pmu.c.intel;
-
-	switch (msr) {
-	case MSR_CORE_PERF_GLOBAL_OVF_CTRL:
-		reg = &ctxt->global_ovf_ctrl;
-		break;
-	case MSR_CORE_PERF_GLOBAL_STATUS:
-		reg = &ctxt->global_status;
-		break;
-	case MSR_CORE_PERF_GLOBAL_CTRL:
-		reg = &ctxt->global_ctrl;
-		break;
-	case MSR_CORE_PERF_FIXED_CTR_CTRL:
-		reg = &ctxt->fixed_ctrl;
-		break;
-	default:
-		switch (type) {
-		case MSR_TYPE_COUNTER:
-			fix_counters = field_offset(ctxt, fixed_counters);
-			reg = &fix_counters[index];
-			break;
-		case MSR_TYPE_ARCH_COUNTER:
-			arch_cntr_pair = field_offset(ctxt, arch_counters);
-			reg = &arch_cntr_pair[index].counter;
-			break;
-		case MSR_TYPE_ARCH_CTRL:
-			arch_cntr_pair = field_offset(ctxt, arch_counters);
-			reg = &arch_cntr_pair[index].control;
-			break;
-		default:
-			return false;
-		}
-	}
-
-	if (reg) {
-		if (is_read)
-			*val = *reg;
-		else {
-			*reg = *val;
-
-			if (msr == MSR_CORE_PERF_GLOBAL_OVF_CTRL)
-				ctxt->global_status &= (~(*val));
-		}
-		return true;
-	}
-
-	return false;
-}
-
-static bool xen_amd_pmu_emulate(u32 msr, u64 *val, bool is_read)
-{
-	uint64_t *reg = NULL;
-	int i, off = 0;
-	struct xen_pmu_amd_ctxt *ctxt;
-	uint64_t *counter_regs, *ctrl_regs;
-	struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
-	uint8_t xenpmu_flags = get_xenpmu_flags();
-
-	if (!xenpmu_data || !(xenpmu_flags & XENPMU_IRQ_PROCESSING))
-		return false;
-
-	if (k7_counters_mirrored &&
-	    ((msr >= MSR_K7_EVNTSEL0) && (msr <= MSR_K7_PERFCTR3)))
-		msr = get_fam15h_addr(msr);
-
-	ctxt = &xenpmu_data->pmu.c.amd;
-	for (i = 0; i < amd_num_counters; i++) {
-		if (msr == amd_ctrls_base + off) {
-			ctrl_regs = field_offset(ctxt, ctrls);
-			reg = &ctrl_regs[i];
-			break;
-		} else if (msr == amd_counters_base + off) {
-			counter_regs = field_offset(ctxt, counters);
-			reg = &counter_regs[i];
-			break;
-		}
-		off += amd_msr_step;
-	}
-
-	if (reg) {
-		if (is_read)
-			*val = *reg;
-		else
-			*reg = *val;
-
-		return true;
-	}
-	return false;
-}
-
-bool pmu_msr_chk_emulated(u32 msr, u64 *val, bool is_read)
-{
-	int type, index = 0;
-
-	if (is_amd_pmu_msr(msr))
-		return xen_amd_pmu_emulate(msr, val, is_read);
-
-	if (is_intel_pmu_msr(msr, &type, &index))
-		return xen_intel_pmu_emulate(msr, val, type, index, is_read);
-
-	return false;
-}
-
-static u64 xen_amd_read_pmc(int counter)
-{
-	struct xen_pmu_amd_ctxt *ctxt;
-	uint64_t *counter_regs;
-	struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
-	uint8_t xenpmu_flags = get_xenpmu_flags();
-
-	if (!xenpmu_data || !(xenpmu_flags & XENPMU_IRQ_PROCESSING)) {
-		u32 msr;
-		u64 val;
-
-		msr = amd_counters_base + (counter * amd_msr_step);
-		native_read_msr_safe(msr, &val);
-		return val;
-	}
-
-	ctxt = &xenpmu_data->pmu.c.amd;
-	counter_regs = field_offset(ctxt, counters);
-	return counter_regs[counter];
-}
-
-static u64 xen_intel_read_pmc(int counter)
-{
-	struct xen_pmu_intel_ctxt *ctxt;
-	uint64_t *fixed_counters;
-	struct xen_pmu_cntr_pair *arch_cntr_pair;
-	struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
-	uint8_t xenpmu_flags = get_xenpmu_flags();
-
-	if (!xenpmu_data || !(xenpmu_flags & XENPMU_IRQ_PROCESSING)) {
-		u32 msr;
-		u64 val;
-
-		if (counter & (1 << INTEL_PMC_TYPE_SHIFT))
-			msr = MSR_CORE_PERF_FIXED_CTR0 + (counter & 0xffff);
-		else
-			msr = MSR_IA32_PERFCTR0 + counter;
-
-		native_read_msr_safe(msr, &val);
-		return val;
-	}
-
-	ctxt = &xenpmu_data->pmu.c.intel;
-	if (counter & (1 << INTEL_PMC_TYPE_SHIFT)) {
-		fixed_counters = field_offset(ctxt, fixed_counters);
-		return fixed_counters[counter & 0xffff];
-	}
-
-	arch_cntr_pair = field_offset(ctxt, arch_counters);
-	return arch_cntr_pair[counter].counter;
-}
-
-u64 xen_read_pmc(int counter)
-{
-	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
-		return xen_amd_read_pmc(counter);
-	else
-		return xen_intel_read_pmc(counter);
-}
-
-int pmu_apic_update(uint32_t val)
-{
+	struct xen_pmu_reg reg = { .index = msr, .value = *val };
+	struct xen_pmu_reg_batch batch = { .nr = 1 };
 	int ret;
-	struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
 
-	if (!xenpmu_data) {
-		pr_warn_once("%s: pmudata not initialized\n", __func__);
-		return -EINVAL;
-	}
+	set_xen_guest_handle(batch.regs, &reg);
 
-	xenpmu_data->pmu.l.lapic_lvtpc = val;
-
-	if (get_xenpmu_flags() & XENPMU_IRQ_PROCESSING)
-		return 0;
-
-	ret = HYPERVISOR_xenpmu_op(XENPMU_lvtpc_set, NULL);
+	ret = HYPERVISOR_xenpmu_op(op, &batch);
+	if (!ret && op == XENPMU_read_regs)
+		*val = reg.value;
 
 	return ret;
 }
 
-/* perf callbacks */
-static unsigned int xen_guest_state(void)
+/*
+ * Access PMU MSRs through the hypervisor.  Returns true if @msr was handled,
+ * in which case @err (if not NULL) is set as {read,write}_msr_safe() would.
+ */
+bool pmu_msr_chk_emulated(u32 msr, u64 *val, bool is_read, int *err)
 {
-	const struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
-	unsigned int state = 0;
+	int ret;
 
-	if (!xenpmu_data) {
-		pr_warn_once("%s: pmudata not initialized\n", __func__);
-		return state;
+	if (!is_xen_pmu || !is_pmu_msr(msr))
+		return false;
+
+	ret = xen_pmu_reg_op(is_read ? XENPMU_read_regs : XENPMU_write_regs,
+			     msr, val);
+	if (ret) {
+		if (is_read)
+			*val = 0;
+
+		if (err)
+			*err = -EIO;
+		else
+			pr_warn_once("Failed to %s PMU MSR %#x: %d\n",
+				     is_read ? "read" : "write", msr, ret);
 	}
 
-	if (!xen_initial_domain() || (xenpmu_data->domain_id >= DOMID_SELF))
+	return true;
+}
+
+u64 xen_read_pmc(int counter)
+{
+	/* Xen sets CR4.PCE when we own the PMU. */
+	if (is_xen_pmu)
+		return native_read_pmc(counter);
+
+	return 0;
+}
+
+static int xen_pmu_lvtpc_set(uint32_t val)
+{
+	struct xen_pmu_params xp = {
+		.version.maj = XENPMU_VER_MAJ,
+		.version.min = XENPMU_VER_MIN,
+		.val = val,
+	};
+
+	return HYPERVISOR_xenpmu_op(XENPMU_lvtpc_set, &xp);
+}
+
+int pmu_apic_update(uint32_t val)
+{
+	struct xenpmu *pmu = this_cpu_ptr(&xenpmu_shared);
+
+	if (!pmu->xenpmu_data) {
+		pr_warn_once("%s: pmudata not initialized\n", __func__);
+		return -EINVAL;
+	}
+
+	if (pmu->irq_processing) {
+		pmu->lvtpc = val;
+		return 0;
+	}
+
+	return xen_pmu_lvtpc_set(val);
+}
+
+/*
+ * perf callbacks
+ *
+ * The shared page describes the context interrupted by the PMI being handled,
+ * it is stale outside of xen_pmu_irq_handler().
+ */
+static unsigned int xen_guest_state(void)
+{
+	const struct xenpmu *pmu = this_cpu_ptr(&xenpmu_shared);
+	const struct xen_pmu_data *xenpmu_data = pmu->xenpmu_data;
+	unsigned int state = 0;
+
+	if (!xenpmu_data || !pmu->irq_processing)
+		return state;
+
+	if (xenpmu_data->domain_id == DOMID_XEN)
+		return PERF_GUEST_HYPERVISOR;
+
+	/* Samples from ourselves aren't guest samples. */
+	if (xenpmu_data->domain_id >= DOMID_SELF)
 		return state;
 
 	state |= PERF_GUEST_ACTIVE;
@@ -430,9 +206,65 @@ static unsigned long xen_get_guest_ip(void)
 	return xenpmu_data->pmu.r.regs.ip;
 }
 
+/* Context of this vCPU when entering Xen, for hypervisor callchains. */
+static DEFINE_PER_CPU(struct pt_regs, xen_hv_caller_regs);
+
+static struct pt_regs *
+xen_hypervisor_callchain(struct perf_callchain_entry_ctx *entry,
+			 struct pt_regs *regs)
+{
+	const struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
+	const struct xen_pmu_regs *g = &xenpmu_data->pmu.g.regs;
+	struct pt_regs *caller, *irq_regs;
+	unsigned int i, nr;
+
+	if (perf_callchain_store(entry, xenpmu_data->pmu.r.regs.ip))
+		return NULL;
+
+	nr = min(READ_ONCE(xenpmu_data->hv_stack_nr), XENPMU_HV_STACK_MAX);
+	for (i = 0; i < nr; i++)
+		if (perf_callchain_store(entry, xenpmu_data->hv_stack[i]))
+			return NULL;
+
+	if (!(xenpmu_data->pmu.pmu_flags & PMU_SAMPLE_CALLER))
+		return NULL;
+
+	/*
+	 * Xen was running on our behalf, e.g. in a hypercall, and the PMI is
+	 * handled the first time events are unmasked since then.  This happens
+	 * before we schedule, hence the caller context is still the one of the
+	 * current task:
+	 *  - from user mode, its user stack is intact.
+	 *  - from kernel mode, its stack is intact if we are handling the PMI
+	 *    upon returning from Xen.  Otherwise, events were masked (e.g.
+	 *    multicalls are issued with interrupts disabled, the return to user
+	 *    mode unmasks them in HYPERVISOR_iret) and we moved on until
+	 *    unmasking them: the best we can do is to carry on from there,
+	 *    which shares the callers of the hypercall site.
+	 */
+	irq_regs = get_irq_regs();
+	if (!irq_regs)
+		return NULL;
+
+	if (!g->cpl && irq_regs->sp != g->sp)
+		return irq_regs;
+
+	caller = this_cpu_ptr(&xen_hv_caller_regs);
+	memset(caller, 0, sizeof(*caller));
+	caller->ip = g->ip;
+	caller->sp = g->sp;
+	caller->bp = g->bp;
+	caller->flags = g->flags;
+	caller->cs = (g->cs & ~3) | (g->cpl & 3);
+	caller->ss = g->ss;
+
+	return caller;
+}
+
 static struct perf_guest_info_callbacks xen_guest_cbs = {
 	.state                  = xen_guest_state,
 	.get_ip			= xen_get_guest_ip,
+	.hypervisor_callchain	= xen_hypervisor_callchain,
 };
 
 /* Convert registers from Xen's format to Linux' */
@@ -442,6 +274,7 @@ static void xen_convert_regs(const struct xen_pmu_regs *xen_regs,
 	regs->ip = xen_regs->ip;
 	regs->cs = xen_regs->cs;
 	regs->sp = xen_regs->sp;
+	regs->flags = xen_regs->flags;
 
 	if (pmu_flags & PMU_SAMPLE_PV) {
 		if (pmu_flags & PMU_SAMPLE_USER)
@@ -458,26 +291,29 @@ static void xen_convert_regs(const struct xen_pmu_regs *xen_regs,
 
 irqreturn_t xen_pmu_irq_handler(int irq, void *dev_id)
 {
-	int err, ret = IRQ_NONE;
+	struct xenpmu *pmu = this_cpu_ptr(&xenpmu_shared);
+	const struct xen_pmu_data *xenpmu_data = pmu->xenpmu_data;
+	irqreturn_t ret = IRQ_NONE;
 	struct pt_regs regs = {0};
-	const struct xen_pmu_data *xenpmu_data = get_xenpmu_data();
-	uint8_t xenpmu_flags = get_xenpmu_flags();
+	int err;
 
 	if (!xenpmu_data) {
 		pr_warn_once("%s: pmudata not initialized\n", __func__);
 		return ret;
 	}
 
-	this_cpu_ptr(&xenpmu_shared)->flags =
-		xenpmu_flags | XENPMU_IRQ_PROCESSING;
+	/* Unless the handler asks otherwise, re-arm the PMI once done. */
+	pmu->lvtpc = APIC_DM_NMI;
+	pmu->irq_processing = true;
+
 	xen_convert_regs(&xenpmu_data->pmu.r.regs, &regs,
 			 xenpmu_data->pmu.pmu_flags);
 	if (x86_pmu.handle_irq(&regs))
 		ret = IRQ_HANDLED;
 
-	/* Write out cached context to HW */
-	err = HYPERVISOR_xenpmu_op(XENPMU_flush, NULL);
-	this_cpu_ptr(&xenpmu_shared)->flags = xenpmu_flags;
+	pmu->irq_processing = false;
+
+	err = xen_pmu_lvtpc_set(pmu->lvtpc);
 	if (err) {
 		pr_warn_once("%s: failed hypercall, err: %d\n", __func__, err);
 		return IRQ_NONE;
@@ -486,7 +322,48 @@ irqreturn_t xen_pmu_irq_handler(int irq, void *dev_id)
 	return ret;
 }
 
-bool is_xen_pmu;
+/*
+ * PVH: PMIs are delivered through VIRQ_XENPMU once the shared page is set.
+ * The binding is kept until we are done for good, as xen_pmu_finish() may be
+ * called from contexts which can't sleep.
+ */
+static int xen_pmu_bind_virq(int cpu)
+{
+	struct xenpmu *pmu = per_cpu_ptr(&xenpmu_shared, cpu);
+	int irq;
+
+	if (xen_pv_domain() || pmu->irq_name)
+		return 0;
+
+	pmu->irq_name = kasprintf(GFP_KERNEL, "pmu%d", cpu);
+	if (!pmu->irq_name)
+		return -ENOMEM;
+
+	irq = bind_virq_to_irqhandler(VIRQ_XENPMU, cpu, xen_pmu_irq_handler,
+				      IRQF_PERCPU | IRQF_NOBALANCING,
+				      pmu->irq_name, NULL);
+	if (irq < 0) {
+		kfree(pmu->irq_name);
+		pmu->irq_name = NULL;
+		return irq;
+	}
+
+	pmu->irq = irq;
+
+	return 0;
+}
+
+static void xen_pmu_unbind_virq(int cpu)
+{
+	struct xenpmu *pmu = per_cpu_ptr(&xenpmu_shared, cpu);
+
+	if (!pmu->irq_name)
+		return;
+
+	unbind_from_irqhandler(pmu->irq, NULL);
+	kfree(pmu->irq_name);
+	pmu->irq_name = NULL;
+}
 
 void xen_pmu_init(int cpu)
 {
@@ -497,7 +374,8 @@ void xen_pmu_init(int cpu)
 
 	BUILD_BUG_ON(sizeof(struct xen_pmu_data) > PAGE_SIZE);
 
-	if (xen_hvm_domain() || (cpu != 0 && !is_xen_pmu))
+	if (!(xen_pv_domain() || xen_pvh_domain()) || !xen_initial_domain() ||
+	    !xen_feature(XENFEAT_vpmu) || (cpu != 0 && !is_xen_pmu))
 		return;
 
 	xenpmu_data = (struct xen_pmu_data *)get_zeroed_page(GFP_KERNEL);
@@ -507,26 +385,33 @@ void xen_pmu_init(int cpu)
 	}
 	pfn = virt_to_pfn(xenpmu_data);
 
+	/* Ready to handle PMIs as soon as Xen knows about the page. */
+	per_cpu(xenpmu_shared, cpu).xenpmu_data = xenpmu_data;
+	per_cpu(xenpmu_shared, cpu).irq_processing = false;
+
+	err = xen_pmu_bind_virq(cpu);
+	if (err)
+		goto fail;
+
 	xp.val = pfn_to_mfn(pfn);
 	xp.vcpu = cpu;
 	xp.version.maj = XENPMU_VER_MAJ;
 	xp.version.min = XENPMU_VER_MIN;
 	err = HYPERVISOR_xenpmu_op(XENPMU_init, &xp);
-	if (err)
+	if (err) {
+		xen_pmu_unbind_virq(cpu);
 		goto fail;
-
-	per_cpu(xenpmu_shared, cpu).xenpmu_data = xenpmu_data;
-	per_cpu(xenpmu_shared, cpu).flags = 0;
+	}
 
 	if (!is_xen_pmu) {
 		is_xen_pmu = true;
 		perf_register_guest_info_callbacks(&xen_guest_cbs);
-		xen_pmu_arch_init();
 	}
 
 	return;
 
 fail:
+	per_cpu(xenpmu_shared, cpu).xenpmu_data = NULL;
 	if (err == -EOPNOTSUPP || err == -ENOSYS)
 		pr_info_once("VPMU disabled by hypervisor.\n");
 	else
@@ -539,7 +424,7 @@ void xen_pmu_finish(int cpu)
 {
 	struct xen_pmu_params xp;
 
-	if (xen_hvm_domain())
+	if (!per_cpu(xenpmu_shared, cpu).xenpmu_data)
 		return;
 
 	xp.vcpu = cpu;

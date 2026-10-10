@@ -1079,7 +1079,7 @@ static u64 xen_do_read_msr(u32 msr, int *err)
 {
 	u64 val = 0;	/* Avoid uninitialized value for safe variant. */
 
-	if (pmu_msr_chk_emulated(msr, &val, true))
+	if (pmu_msr_chk_emulated(msr, &val, true, err))
 		return val;
 
 	if (err)
@@ -1138,7 +1138,7 @@ static void xen_do_write_msr(u32 msr, u64 val, int *err)
 		break;
 
 	default:
-		if (pmu_msr_chk_emulated(msr, &val, false))
+		if (pmu_msr_chk_emulated(msr, &val, false, err))
 			return;
 
 		if (err)

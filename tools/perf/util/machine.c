@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <regex.h>
 #include <stdlib.h>
@@ -215,6 +216,7 @@ void machine__exit(struct machine *machine)
 
 	machine__destroy_kernel_maps(machine);
 	maps__zput(machine->kmaps);
+	maps__zput(machine->hv_maps);
 	dsos__exit(&machine->dsos);
 	machine__exit_vdso(machine);
 	zfree(&machine->root_dir);
@@ -1214,6 +1216,106 @@ __machine__create_kernel_maps(struct machine *machine, struct dso *kernel)
 
 	map__set_mapping_type(machine->vmlinux_map, MAPPING_TYPE__IDENTITY);
 	return maps__insert(machine__kernel_maps(machine), machine->vmlinux_map);
+}
+
+#ifdef HAVE_LIBELF_SUPPORT
+/*
+ * Map each executable segment of the hypervisor image at its link address, as
+ * the hypervisor (e.g. Xen) runs at a fixed address.
+ */
+static int machine__create_hypervisor_maps(struct machine *machine,
+					   const char *filename)
+{
+	struct dso *dso;
+	size_t i, nr;
+	Elf *elf;
+	int fd, err = -EINVAL;
+
+	fd = open(filename, O_RDONLY);
+	if (fd < 0)
+		return -errno;
+
+	elf = elf_begin(fd, PERF_ELF_C_READ_MMAP, NULL);
+	if (elf == NULL)
+		goto out_close;
+
+	if (elf_getphdrnum(elf, &nr) < 0)
+		goto out_elf;
+
+	err = -ENOMEM;
+	dso = machine__findnew_dso(machine, filename);
+	if (dso == NULL)
+		goto out_elf;
+
+	machine->hv_maps = maps__new(machine);
+	if (machine->hv_maps == NULL)
+		goto out_dso;
+
+	for (i = 0; i < nr; i++) {
+		struct map *map;
+		GElf_Phdr phdr;
+
+		if (gelf_getphdr(elf, i, &phdr) == NULL ||
+		    phdr.p_type != PT_LOAD || !(phdr.p_flags & PF_X))
+			continue;
+
+		map = map__new2(phdr.p_vaddr, dso);
+		if (map == NULL) {
+			err = -ENOMEM;
+			goto out_dso;
+		}
+
+		map__set_end(map, phdr.p_vaddr + phdr.p_memsz);
+		map__set_pgoff(map, phdr.p_offset);
+		err = maps__insert(machine->hv_maps, map);
+		map__put(map);
+		if (err)
+			goto out_dso;
+	}
+
+	/* No executable segment. */
+	err = maps__empty(machine->hv_maps) ? -EINVAL : 0;
+out_dso:
+	dso__put(dso);
+out_elf:
+	elf_end(elf);
+out_close:
+	close(fd);
+	return err;
+}
+#else
+static int machine__create_hypervisor_maps(struct machine *machine __maybe_unused,
+					   const char *filename __maybe_unused)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+/*
+ * Maps of the hypervisor running underneath the host kernel, for samples with
+ * the PERF_RECORD_MISC_HYPERVISOR cpumode.  Only available when the hypervisor
+ * image has been specified with symbol_conf.hypervisor_name.
+ */
+struct maps *machine__hypervisor_maps(struct machine *machine)
+{
+	if (!symbol_conf.hypervisor_name || !machine__is_host(machine))
+		return NULL;
+
+	if (!machine->hv_maps_init) {
+		char sbuf[STRERR_BUFSIZE];
+		int err;
+
+		machine->hv_maps_init = true;
+		err = machine__create_hypervisor_maps(machine,
+						      symbol_conf.hypervisor_name);
+		if (err) {
+			pr_err("Failed to load hypervisor image %s: %s\n",
+			       symbol_conf.hypervisor_name, str_error_r(-err, sbuf, sizeof(sbuf)));
+			maps__zput(machine->hv_maps);
+		}
+	}
+
+	return machine->hv_maps;
 }
 
 void machine__destroy_kernel_maps(struct machine *machine)
